@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DFA Drawing</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a23; --line: #2a2f3d; --text: #e6e8ee; --muted: #8b92a5;
+    --canvas: #0b0d12; --gold: #f5c542; --bad: #9ca3af;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 20px; align-items: start; }
+  @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
+  input, select, button { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  input { flex: 1 1 220px; min-width: 0; }
+  button { cursor: pointer; }
+  button:hover, select:hover { border-color: var(--muted); }
+  label { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+  canvas { width: 100%; aspect-ratio: 1; display: block; background: var(--canvas); border-radius: 12px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 18px 0 8px; }
+  .panel h2:first-child { margin-top: 0; }
+  .verdict { font-size: 20px; font-weight: 600; }
+  .verdict.yes { color: var(--gold); }
+  .verdict.no { color: var(--bad); }
+  .chip { display: inline-block; padding: 1px 8px; border-radius: 999px; color: #0b0d12; font-weight: 600; font-size: 13px; }
+  .trace { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: 13px; max-height: 220px; overflow: auto; }
+  .trace .arrow { color: var(--muted); font-family: ui-monospace, Consolas, monospace; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  td small { color: var(--muted); }
+  .about { color: var(--muted); margin: 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>DFA Drawing</h1>
+  <p class="sub">Type a string. The automaton reads it one character at a time, and every transition paints a stroke in the colour of the state it was in. Same string, same painting.</p>
+
+  <div class="layout">
+    <section>
+      <div class="controls">
+        <input id="text" value="automaton" placeholder="Type a name, a word, or 0s and 1s" autocomplete="off" spellcheck="false">
+        <select id="machine" aria-label="Machine"></select>
+        <label>Symmetry <select id="sym">
+          <option>1</option><option>2</option><option>3</option><option>4</option><option selected>6</option><option>8</option>
+        </select></label>
+        <button id="replay">Replay</button>
+        <button id="save">Save PNG</button>
+      </div>
+      <canvas id="art"></canvas>
+    </section>
+
+    <aside class="panel">
+      <h2>Verdict</h2>
+      <div id="verdict" class="verdict"></div>
+      <h2>Machine</h2>
+      <p id="about" class="about"></p>
+      <h2>Run</h2>
+      <div id="trace" class="trace"></div>
+      <h2>Transitions <small style="text-transform:none;letter-spacing:0">(next state, turn, length)</small></h2>
+      <table id="table"></table>
+    </aside>
+  </div>
+</main>
+
+<script src="dfa.js"></script>
+<script>
+const { MACHINES, run, strokes } = DFA;
+const $ = (id) => document.getElementById(id);
+const canvas = $("art"), ctx = canvas.getContext("2d");
+const BG = "#0b0d12", GOLD = "#f5c542";
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+
+for (const [key, m] of Object.entries(MACHINES)) $("machine").add(new Option(m.name, key));
+
+let anim = null;
+
+function chip(m, state) {
+  const acc = m.accept.includes(state), c = m.colour[state];
+  // Accepting states get a double ring, like in a state diagram.
+  const ring = acc ? `box-shadow:0 0 0 2px var(--panel),0 0 0 4px ${c};margin:0 3px;` : "";
+  return `<span class="chip" style="background:${c};${ring}" title="${acc ? "accepting state" : "state"}">${esc(state)}</span>`;
+}
+
+function renderPanel(m, result) {
+  $("verdict").textContent = result.accepted ? "Accepted" : "Rejected";
+  $("verdict").className = "verdict " + (result.accepted ? "yes" : "no");
+  $("about").textContent = m.about;
+
+  const shown = result.steps.slice(0, 80);
+  let html = chip(m, m.start);
+  for (const s of shown) html += `<span class="arrow">─${esc(s.ch === " " ? "␣" : s.ch)}→</span>${chip(m, s.to)}`;
+  if (result.steps.length > shown.length) html += `<span class="arrow">… ${result.steps.length - shown.length} more</span>`;
+  $("trace").innerHTML = html;
+
+  const syms = Object.keys(m.symbols);
+  let t = `<tr><th></th>${syms.map((s) => `<th>${esc(m.symbols[s])}</th>`).join("")}</tr>`;
+  for (const state of Object.keys(m.delta)) {
+    t += `<tr><td>${chip(m, state)}</td>` + syms.map((s) => {
+      const [to, turn, len] = m.delta[state][s];
+      return `<td>${chip(m, to)}<br><small>${turn}°, ${len}</small></td>`;
+    }).join("") + "</tr>";
+  }
+  $("table").innerHTML = t;
+}
+
+function sizeCanvas() {
+  const px = Math.round(canvas.clientWidth * (window.devicePixelRatio || 1));
+  if (canvas.width !== px) canvas.width = canvas.height = px;
+}
+
+// Draws the first `count` strokes; when the run is complete, also the ending (frame for accept, fade for reject).
+function paint(m, result, segs, count, sym) {
+  const S = canvas.width, u = S / 600;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = BG;
+  ctx.fillRect(0, 0, S, S);
+
+  // Fit: scale so the path's farthest point from the start stays inside the canvas; don't blow up short strings.
+  let maxR = 1;
+  for (const g of segs) maxR = Math.max(maxR, Math.hypot(g.x2, g.y2));
+  const scale = Math.min((S * 0.42) / maxR, 2.2 * u);
+  const width = Math.max(1.5, 5 - segs.length / 40) * u;
+
+  ctx.lineCap = ctx.lineJoin = "round";
+  for (let r = 0; r < sym; r++) {
+    ctx.setTransform(1, 0, 0, 1, S / 2, S / 2);
+    ctx.rotate((2 * Math.PI * r) / sym);
+    ctx.scale(scale, scale);
+    for (let i = 0; i < count; i++) {
+      const g = segs[i];
+      ctx.strokeStyle = ctx.shadowColor = g.colour;
+      ctx.shadowBlur = 10 * u;
+      ctx.lineWidth = width / scale;
+      ctx.beginPath();
+      ctx.moveTo(g.x1, g.y1);
+      ctx.lineTo(g.x2, g.y2);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = g.colour;
+      ctx.beginPath();
+      ctx.arc(g.x2, g.y2, (width * 0.9) / scale, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+    if (count === 0) {  // empty string: just the start state
+      ctx.fillStyle = m.colour[m.start];
+      ctx.beginPath();
+      ctx.arc(0, 0, (6 * u) / scale, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (count < segs.length) return;
+
+  const end = segs.length ? segs[segs.length - 1] : { x2: 0, y2: 0 };
+  if (result.accepted) {
+    // Bloom at every copy of the end point, then a gold frame.
+    for (let r = 0; r < sym; r++) {
+      const a = (2 * Math.PI * r) / sym;
+      const x = S / 2 + scale * (end.x2 * Math.cos(a) - end.y2 * Math.sin(a));
+      const y = S / 2 + scale * (end.x2 * Math.sin(a) + end.y2 * Math.cos(a));
+      const glow = ctx.createRadialGradient(x, y, 0, x, y, 26 * u);
+      glow.addColorStop(0, m.colour[result.final]);
+      glow.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = glow;
+      ctx.beginPath();
+      ctx.arc(x, y, 26 * u, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+    ctx.strokeStyle = GOLD;
+    ctx.lineWidth = 8 * u;
+    ctx.strokeRect(10 * u, 10 * u, S - 20 * u, S - 20 * u);
+  } else {
+    ctx.fillStyle = "rgba(11,13,18,0.55)";
+    ctx.fillRect(0, 0, S, S);
+    ctx.strokeStyle = "#6b7280";
+    ctx.lineWidth = 3 * u;
+    ctx.setLineDash([14 * u, 10 * u]);
+    ctx.strokeRect(10 * u, 10 * u, S - 20 * u, S - 20 * u);
+    ctx.setLineDash([]);
+  }
+}
+
+function draw() {
+  sizeCanvas();
+  if (anim) cancelAnimationFrame(anim);
+  const m = MACHINES[$("machine").value];
+  const sym = Number($("sym").value);
+  const result = run(m, $("text").value);
+  const segs = strokes(m, result.steps);
+  renderPanel(m, result);
+
+  // Reveal one stroke at a time; long strings speed up so a replay takes at most ~1.5 s.
+  const per = Math.min(70, 1500 / Math.max(1, segs.length));
+  const t0 = performance.now();
+  const frame = (t) => {
+    const count = Math.min(segs.length, Math.floor((t - t0) / per) + 1);
+    paint(m, result, segs, count, sym);
+    anim = count < segs.length ? requestAnimationFrame(frame) : null;
+  };
+  anim = requestAnimationFrame(frame);
+  return () => paint(m, result, segs, segs.length, sym);
+}
+
+let finish = draw();
+for (const id of ["text", "machine", "sym"]) $(id).addEventListener("input", () => { finish = draw(); });
+$("replay").addEventListener("click", () => { finish = draw(); });
+$("save").addEventListener("click", () => {
+  if (anim) { cancelAnimationFrame(anim); anim = null; }
+  finish();
+  const a = document.createElement("a");
+  a.download = `${$("machine").value}-${$("text").value.replace(/[^\w-]+/g, "_") || "empty"}.png`;
+  a.href = canvas.toDataURL("image/png");
+  a.click();
+});
+window.addEventListener("resize", () => { finish = draw(); });
+</script>
+</body>
+</html>
