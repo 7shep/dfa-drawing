@@ -19,8 +19,10 @@
   .controls { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
   input, select, button { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
   input { flex: 1 1 220px; min-width: 0; }
+  select { max-width: 100%; }
   button { cursor: pointer; }
   button:hover, select:hover { border-color: var(--muted); }
+  button[hidden] { display: none; }
   label { display: flex; align-items: center; gap: 6px; color: var(--muted); }
   canvas { width: 100%; aspect-ratio: 1; display: block; background: var(--canvas); border-radius: 12px; }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
@@ -29,20 +31,28 @@
   .verdict { font-size: 20px; font-weight: 600; }
   .verdict.yes { color: var(--gold); }
   .verdict.no { color: var(--bad); }
+  .note { color: var(--muted); font-size: 13px; margin: 2px 0 0; }
   .chip { display: inline-block; padding: 1px 8px; border-radius: 999px; color: #0b0d12; font-weight: 600; font-size: 13px; }
+  .set { white-space: nowrap; color: var(--muted); font-family: ui-monospace, Consolas, monospace; }
+  .set .chip { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; padding: 1px 6px; margin: 0 1px; }
   .trace { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: 13px; max-height: 220px; overflow: auto; }
   .trace .arrow { color: var(--muted); font-family: ui-monospace, Consolas, monospace; }
+  .table-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
   th { color: var(--muted); font-weight: 500; }
   td small { color: var(--muted); }
+  td .move + .move { margin-top: 4px; }
+  .none { color: var(--muted); }
   .about { color: var(--muted); margin: 0; }
+  .count { margin: 0; }
+  .count b { color: var(--text); }
 </style>
 </head>
 <body>
 <main>
   <h1>DFA Drawing</h1>
-  <p class="sub">Type a string. The automaton reads it one character at a time, and every transition paints a stroke in the colour of the state it was in. Same string, same painting.</p>
+  <p class="sub">Type a string. The automaton reads it one character at a time, and every transition paints a stroke in the colour of the state it was in. An NFA paints one brush per path: brushes split when there is a choice and fade out when a path dies. Same string, same painting.</p>
 
   <div class="layout">
     <section>
@@ -52,6 +62,7 @@
         <label>Symmetry <select id="sym">
           <option>1</option><option>2</option><option>3</option><option>4</option><option selected>6</option><option>8</option>
         </select></label>
+        <button id="convert" hidden>Convert to DFA</button>
         <button id="replay">Replay</button>
         <button id="save">Save PNG</button>
       </div>
@@ -61,27 +72,44 @@
     <aside class="panel">
       <h2>Verdict</h2>
       <div id="verdict" class="verdict"></div>
+      <p id="brushes" class="note"></p>
       <h2>Machine</h2>
       <p id="about" class="about"></p>
+      <h2>States</h2>
+      <p id="count" class="count"></p>
       <h2>Run</h2>
       <div id="trace" class="trace"></div>
       <h2>Transitions <small style="text-transform:none;letter-spacing:0">(next state, turn, length)</small></h2>
-      <table id="table"></table>
+      <div class="table-wrap"><table id="table"></table></div>
     </aside>
   </div>
 </main>
 
 <script src="dfa.js"></script>
 <script>
-const { MACHINES, run, strokes } = DFA;
+const { MACHINES, EPS, run, strokes, runNFA, nfaStrokes, toDFA } = DFA;
 const $ = (id) => document.getElementById(id);
 const canvas = $("art"), ctx = canvas.getContext("2d");
 const BG = "#0b0d12", GOLD = "#f5c542";
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const isNFA = (m) => m.kind === "nfa";
 
-for (const [key, m] of Object.entries(MACHINES)) $("machine").add(new Option(m.name, key));
+const groups = { DFAs: (m) => !isNFA(m), NFAs: isNFA };
+for (const [label, keep] of Object.entries(groups)) {
+  const g = document.createElement("optgroup");
+  g.label = label;
+  for (const [key, m] of Object.entries(MACHINES)) if (keep(m)) g.append(new Option(m.name, key));
+  $("machine").append(g);
+}
 
 let anim = null;
+let converted = false;  // showing the subset-construction DFA of the selected NFA
+
+// The machine on screen: the selected one, or the DFA built from it.
+function current() {
+  const base = MACHINES[$("machine").value];
+  return { base, m: converted && isNFA(base) ? toDFA(base) : base };
+}
 
 function chip(m, state) {
   const acc = m.accept.includes(state), c = m.colour[state];
@@ -89,24 +117,48 @@ function chip(m, state) {
   const ring = acc ? `box-shadow:0 0 0 2px var(--panel),0 0 0 4px ${c};margin:0 3px;` : "";
   return `<span class="chip" style="background:${c};${ring}" title="${acc ? "accepting state" : "state"}">${esc(state)}</span>`;
 }
+// An NFA's current set of states, e.g. { q0 q2 }.
+const setChips = (m, set) => `<span class="set">{${set.map((q) => chip(m, q)).join("")}}</span>`;
 
-function renderPanel(m, result) {
+function renderPanel(m, base, result, art) {
   $("verdict").textContent = result.accepted ? "Accepted" : "Rejected";
   $("verdict").className = "verdict " + (result.accepted ? "yes" : "no");
   $("about").textContent = m.about;
 
+  if (isNFA(m)) {
+    const alive = art.brushes.length, died = art.deaths.length;
+    $("brushes").textContent = `${alive} brush${alive === 1 ? "" : "es"} still alive, ${died} died along the way` +
+      (art.capped ? ` (capped at ${DFA.MAX_BRUSHES} brushes)` : "") + ". Accepted if any brush ends in an accepting state.";
+  } else {
+    $("brushes").textContent = "";
+  }
+
+  if (isNFA(base)) {
+    const n = Object.keys(base.delta).length, d = Object.keys(toDFA(base).delta).length;
+    $("count").innerHTML = `NFA: <b>${n}</b> states → DFA: <b>${d}</b> states` +
+      `<br><small class="none">${converted ? "Showing the DFA. Each state is a set of NFA states." : "Press Convert to DFA to see the subset construction."}</small>`;
+  } else {
+    $("count").innerHTML = `DFA: <b>${Object.keys(m.delta).length}</b> states`;
+  }
+
+  const show = isNFA(m) ? (set) => setChips(m, set) : (state) => chip(m, state);
   const shown = result.steps.slice(0, 80);
-  let html = chip(m, m.start);
-  for (const s of shown) html += `<span class="arrow">─${esc(s.ch === " " ? "␣" : s.ch)}→</span>${chip(m, s.to)}`;
+  let html = show(isNFA(m) ? result.start : m.start);
+  for (const s of shown) html += `<span class="arrow">─${esc(s.ch === " " ? "␣" : s.ch)}→</span>${show(s.to)}`;
   if (result.steps.length > shown.length) html += `<span class="arrow">… ${result.steps.length - shown.length} more</span>`;
   $("trace").innerHTML = html;
 
   const syms = Object.keys(m.symbols);
-  let t = `<tr><th></th>${syms.map((s) => `<th>${esc(m.symbols[s])}</th>`).join("")}</tr>`;
-  for (const state of Object.keys(m.delta)) {
-    t += `<tr><td>${chip(m, state)}</td>` + syms.map((s) => {
-      const [to, turn, len] = m.delta[state][s];
-      return `<td>${chip(m, to)}<br><small>${turn}°, ${len}</small></td>`;
+  const states = Object.keys(m.delta);
+  // NFAs: each cell lists every move (maybe none). An ε column appears only if the machine has ε-moves.
+  const cols = isNFA(m) && states.some((q) => m.delta[q][EPS]) ? [...syms, EPS] : syms;
+  const move = ([to, turn, len]) => `<div class="move">${chip(m, to)}<br><small>${turn}°, ${len}</small></div>`;
+  let t = `<tr><th></th>${cols.map((s) => `<th>${esc(s === EPS ? "ε" : m.symbols[s])}</th>`).join("")}</tr>`;
+  for (const state of states) {
+    t += `<tr><td>${chip(m, state)}</td>` + cols.map((s) => {
+      if (!isNFA(m)) return `<td>${move(m.delta[state][s])}</td>`;
+      const list = m.delta[state][s] || [];
+      return `<td>${list.length ? list.map(move).join("") : `<span class="none" title="no move: this path dies">—</span>`}</td>`;
     }).join("") + "</tr>";
   }
   $("table").innerHTML = t;
@@ -117,14 +169,16 @@ function sizeCanvas() {
   if (canvas.width !== px) canvas.width = canvas.height = px;
 }
 
-// Draws the first `count` strokes; when the run is complete, also the ending (frame for accept, fade for reject).
-function paint(m, result, segs, count, sym) {
+// Draws every stroke and death up to character `upTo` (step 0 is the NFA's ε-moves before reading anything).
+// When the whole string has been drawn, also the ending: frame + bloom on accepting brushes, or a fade for reject.
+function paint(m, result, art, upTo, steps, sym) {
+  const { segs, deaths, ends } = art;
   const S = canvas.width, u = S / 600;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = BG;
   ctx.fillRect(0, 0, S, S);
 
-  // Fit: scale so the path's farthest point from the start stays inside the canvas; don't blow up short strings.
+  // Fit: scale so the farthest point from the start stays inside the canvas; don't blow up short strings.
   let maxR = 1;
   for (const g of segs) maxR = Math.max(maxR, Math.hypot(g.x2, g.y2));
   const scale = Math.min((S * 0.42) / maxR, 2.2 * u);
@@ -135,22 +189,38 @@ function paint(m, result, segs, count, sym) {
     ctx.setTransform(1, 0, 0, 1, S / 2, S / 2);
     ctx.rotate((2 * Math.PI * r) / sym);
     ctx.scale(scale, scale);
-    for (let i = 0; i < count; i++) {
-      const g = segs[i];
+    for (const g of segs) {
+      if (g.step > upTo) break;
       ctx.strokeStyle = ctx.shadowColor = g.colour;
-      ctx.shadowBlur = 10 * u;
-      ctx.lineWidth = width / scale;
+      // ε-moves are thin dashed strokes: the machine moved without reading anything.
+      ctx.shadowBlur = g.eps ? 0 : 10 * u;
+      ctx.lineWidth = (g.eps ? width * 0.5 : width) / scale;
+      ctx.setLineDash(g.eps ? [(4 * u) / scale, (4 * u) / scale] : []);
       ctx.beginPath();
       ctx.moveTo(g.x1, g.y1);
       ctx.lineTo(g.x2, g.y2);
       ctx.stroke();
+      ctx.setLineDash([]);
       ctx.shadowBlur = 0;
       ctx.fillStyle = g.colour;
       ctx.beginPath();
       ctx.arc(g.x2, g.y2, (width * 0.9) / scale, 0, 2 * Math.PI);
       ctx.fill();
     }
-    if (count === 0) {  // empty string: just the start state
+    // A dying brush leaves a small dot that fades out at its edge.
+    for (const d of deaths) {
+      if (d.step > upTo) continue;
+      const rad = (width * 2.4) / scale;
+      const fade = ctx.createRadialGradient(d.x, d.y, 0, d.x, d.y, rad);
+      fade.addColorStop(0, d.colour);
+      fade.addColorStop(0.35, d.colour + "99");
+      fade.addColorStop(1, d.colour + "00");
+      ctx.fillStyle = fade;
+      ctx.beginPath();
+      ctx.arc(d.x, d.y, rad, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+    if (!segs.length) {  // empty string: just the start state
       ctx.fillStyle = m.colour[m.start];
       ctx.beginPath();
       ctx.arc(0, 0, (6 * u) / scale, 0, 2 * Math.PI);
@@ -158,22 +228,23 @@ function paint(m, result, segs, count, sym) {
     }
   }
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  if (count < segs.length) return;
+  if (upTo < steps) return;
 
-  const end = segs.length ? segs[segs.length - 1] : { x2: 0, y2: 0 };
   if (result.accepted) {
-    // Bloom at every copy of the end point, then a gold frame.
-    for (let r = 0; r < sym; r++) {
-      const a = (2 * Math.PI * r) / sym;
-      const x = S / 2 + scale * (end.x2 * Math.cos(a) - end.y2 * Math.sin(a));
-      const y = S / 2 + scale * (end.x2 * Math.sin(a) + end.y2 * Math.cos(a));
-      const glow = ctx.createRadialGradient(x, y, 0, x, y, 26 * u);
-      glow.addColorStop(0, m.colour[result.final]);
-      glow.addColorStop(1, "rgba(0,0,0,0)");
-      ctx.fillStyle = glow;
-      ctx.beginPath();
-      ctx.arc(x, y, 26 * u, 0, 2 * Math.PI);
-      ctx.fill();
+    // Bloom at every copy of every accepting end point, then a gold frame.
+    for (const end of ends) {
+      for (let r = 0; r < sym; r++) {
+        const a = (2 * Math.PI * r) / sym;
+        const x = S / 2 + scale * (end.x * Math.cos(a) - end.y * Math.sin(a));
+        const y = S / 2 + scale * (end.x * Math.sin(a) + end.y * Math.cos(a));
+        const glow = ctx.createRadialGradient(x, y, 0, x, y, 26 * u);
+        glow.addColorStop(0, end.colour);
+        glow.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.fillStyle = glow;
+        ctx.beginPath();
+        ctx.arc(x, y, 26 * u, 0, 2 * Math.PI);
+        ctx.fill();
+      }
     }
     ctx.strokeStyle = GOLD;
     ctx.lineWidth = 8 * u;
@@ -189,35 +260,54 @@ function paint(m, result, segs, count, sym) {
   }
 }
 
+// Runs the machine and turns the run into strokes, deaths and accepting end points, for a DFA or an NFA alike.
+function compute(m, text) {
+  if (isNFA(m)) {
+    const result = runNFA(m, text);
+    const art = nfaStrokes(m, text);
+    art.ends = art.brushes.filter((b) => m.accept.includes(b.state)).map((b) => ({ x: b.x, y: b.y, colour: m.colour[b.state] }));
+    return { result, art };
+  }
+  const result = run(m, text);
+  const segs = strokes(m, result.steps);
+  const last = segs.length ? segs[segs.length - 1] : { x2: 0, y2: 0 };
+  const ends = result.accepted ? [{ x: last.x2, y: last.y2, colour: m.colour[result.final] }] : [];
+  return { result, art: { segs, deaths: [], ends } };
+}
+
 function draw() {
   sizeCanvas();
   if (anim) cancelAnimationFrame(anim);
-  const m = MACHINES[$("machine").value];
+  const { base, m } = current();
+  $("convert").hidden = !isNFA(base);
+  $("convert").textContent = converted ? "Back to NFA" : "Convert to DFA";
   const sym = Number($("sym").value);
-  const result = run(m, $("text").value);
-  const segs = strokes(m, result.steps);
-  renderPanel(m, result);
+  const { result, art } = compute(m, $("text").value);
+  const steps = result.steps.length;
+  renderPanel(m, base, result, art);
 
-  // Reveal one stroke at a time; long strings speed up so a replay takes at most ~1.5 s.
-  const per = Math.min(70, 1500 / Math.max(1, segs.length));
+  // Reveal one character's strokes at a time; long strings speed up so a replay takes at most ~1.5 s.
+  const per = Math.min(70, 1500 / Math.max(1, steps));
   const t0 = performance.now();
   const frame = (t) => {
-    const count = Math.min(segs.length, Math.floor((t - t0) / per) + 1);
-    paint(m, result, segs, count, sym);
-    anim = count < segs.length ? requestAnimationFrame(frame) : null;
+    const upTo = Math.min(steps, Math.floor((t - t0) / per) + 1);
+    paint(m, result, art, upTo, steps, sym);
+    anim = upTo < steps ? requestAnimationFrame(frame) : null;
   };
   anim = requestAnimationFrame(frame);
-  return () => paint(m, result, segs, segs.length, sym);
+  return () => paint(m, result, art, steps, steps, sym);
 }
 
 let finish = draw();
-for (const id of ["text", "machine", "sym"]) $(id).addEventListener("input", () => { finish = draw(); });
+$("machine").addEventListener("input", () => { converted = false; finish = draw(); });
+for (const id of ["text", "sym"]) $(id).addEventListener("input", () => { finish = draw(); });
+$("convert").addEventListener("click", () => { converted = !converted; finish = draw(); });
 $("replay").addEventListener("click", () => { finish = draw(); });
 $("save").addEventListener("click", () => {
   if (anim) { cancelAnimationFrame(anim); anim = null; }
   finish();
   const a = document.createElement("a");
-  a.download = `${$("machine").value}-${$("text").value.replace(/[^\w-]+/g, "_") || "empty"}.png`;
+  a.download = `${$("machine").value}${converted ? "-dfa" : ""}-${$("text").value.replace(/[^\w-]+/g, "_") || "empty"}.png`;
   a.href = canvas.toDataURL("image/png");
   a.click();
 });
